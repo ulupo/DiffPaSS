@@ -76,14 +76,15 @@ class DiffPaSSResults:
     ]
     # Hard losses
     hard_losses: Union[
-        GradientDescentList[GroupByGroupList[float]],
-        BootstrapList[GradientDescentList[GroupByGroupList[float]]],
+        GradientDescentList[float],
+        GradientDescentList[np.ndarray],
+        BootstrapList[GradientDescentList[float]],
     ]
     # Soft losses
     soft_losses: Optional[
         Union[
-            GradientDescentList[GroupByGroupList[float]],
-            BootstrapList[GradientDescentList[GroupByGroupList[float]]],
+            GradientDescentList[float],
+            BootstrapList[GradientDescentList[float]],
         ]
     ]
 
@@ -318,7 +319,9 @@ class DiffPaSSModel(Module):
                     for perms_this_group in perms
                 ]
             )
-            results.hard_losses.append(loss.item())
+            results.hard_losses.append(
+                dccn(loss) if self.permutation.batch_size is not None else loss.item()
+            )
 
     def _soft_pass(
         self,
@@ -367,9 +370,9 @@ class DiffPaSSModel(Module):
 
     def check_can_optimize(self) -> bool:
         n_samples = sum(self.group_sizes)
-        n_effectively_fixed = self.permutation._total_number_fixed_pairings
+        n_effectively_fixed = np.array(self.permutation._total_number_fixed_pairings)
 
-        return n_effectively_fixed < n_samples
+        return np.all(n_effectively_fixed < n_samples)
 
     def mean_center_log_alphas(self) -> None:
         with torch.no_grad():
@@ -420,7 +423,7 @@ class DiffPaSSModel(Module):
                         record_soft_perms=record_soft_perms,
                         record_soft_losses=record_soft_losses,
                     )
-                    loss.backward()
+                    loss.sum().backward()
                     optimizer.step()
                     optimizer.zero_grad()
                     if mean_centering:
@@ -509,16 +512,17 @@ class DiffPaSSModel(Module):
         x: torch.Tensor,  # The object (MSA or adjacency matrix of graphs) to be permuted
         y: torch.Tensor,  # The target object (MSA or adjacency matrix of graphs), that the objects represented by `x` should be paired with. Not acted upon by soft/hard permutations
         *,
-        n_start: int = 1,  # Number of fixed pairings to choose among the pairs not already fixed by `self.fixed_pairings`, using the results of the first call to `fit`
+        n_start: int = 1,  # Number of fixed pairings to choose among the pairs not already fixed by `self.fixed_pairings`, using the results of the first call to `fit`. Default: ``1``
         n_end: Optional[
             int
-        ] = None,  # If ``None``, the bootstrap will end when all pairs are fixed. Otherwise, the bootstrap will end when `n_end` pairs are fixed
-        step_size: int = 1,  # Difference between the number of fixed pairings chosen at consecutive bootstrap iterations
-        n_repeats: int = 1,  # At each bootstrap iteration, `n_repeats` runs will be performed, and the run with the lowest loss will be chosen
+        ] = None,  # If ``None``, the bootstrap will end when all pairs are fixed. Otherwise, the bootstrap will end when `n_end` pairs are fixed. Default: ``None``
+        step_size: int = 1,  # Difference between the number of fixed pairings chosen at consecutive bootstrap iterations. Default: ``1``
+        n_repeats: int = 1,  # At each bootstrap iteration, `n_repeats` runs will be performed, and the run with the lowest loss will be chosen. Default: ``1``
+        parallelize_repeats: bool = False,  # If ``True``, parallelize the `n_repeats` runs at each bootstrap iteration, by batching. Can cause OOM errors if `n_repeats` is large. Default: ``False``
         show_pbar: bool = True,  # If ``True``, show progress bar. Default: ``True``
         single_fit_cfg: Optional[
             dict
-        ] = None,  # If not ``None``, configuration dictionary for gradient optimization in each bootstrap iteration (call to `fit`). See `fit` for details
+        ] = None,  # If not ``None``, custom configuration dictionary for gradient optimization in each bootstrap iteration (call to `fit`). See `fit` for details. ``None`` means using the default parameters of `fit`. Default: ``None``
     ) -> (
         DiffPaSSResults
     ):  # `DiffPaSSResults` container for fit results. All attributes are lists indexed by bootstrap iteration, containing lists indexed by gradient descent iteration as per `fit`
@@ -643,6 +647,11 @@ class DiffPaSSModel(Module):
         _single_fit_cfg = deepcopy(self.single_fit_default_cfg)
         if single_fit_cfg is not None:
             _single_fit_cfg.update(single_fit_cfg)
+        if parallelize_repeats:
+            # FIXME: This is just a temporary solution to limit memory usage
+            _single_fit_cfg["record_log_alphas"] = False
+            _single_fit_cfg["record_soft_perms"] = False
+            _single_fit_cfg["record_soft_losses"] = False
         single_fit_cfg = _single_fit_cfg
 
         # Initialize DiffPaSSResults object
@@ -681,20 +690,48 @@ class DiffPaSSModel(Module):
             results_this_iter = (
                 get_results_to_use_in_each_bootstrap_iter()
             )  # `results` alias if `n_repeats` == 1
-            for _ in range(n_repeats):
+            if not parallelize_repeats:
+                for _ in range(n_repeats):
+                    # Randomly sample N fixed pairings
+                    fixed_pairings = make_new_fixed_pairings(mapped_idxs, N)
+                    # Reinitialize permutation module with new fixed pairings
+                    self.permutation.init_batch_size_fixed_pairings_and_log_alphas(
+                        batch_size=None,
+                        fixed_pairings=fixed_pairings,
+                        device=x.device,
+                    )
+                    # Fit with gradient descent
+                    can_optimize = self._fit(
+                        x, y, results=results_this_iter, **single_fit_cfg
+                    )
+                    if not can_optimize:
+                        # If we can't fit, we break the "repeats" loop
+                        break
+            else:
                 # Randomly sample N fixed pairings
-                fixed_pairings = make_new_fixed_pairings(mapped_idxs, N)
+                fixed_pairings = [
+                    make_new_fixed_pairings(mapped_idxs, N) for _ in range(n_repeats)
+                ]
                 # Reinitialize permutation module with new fixed pairings
-                self.permutation.init_fixed_pairings_and_log_alphas(
-                    fixed_pairings, device=x.device
+                self.permutation.init_batch_size_fixed_pairings_and_log_alphas(
+                    batch_size=n_repeats,
+                    fixed_pairings=fixed_pairings,
+                    device=x.device,
                 )
                 # Fit with gradient descent
                 can_optimize = self._fit(
                     x, y, results=results_this_iter, **single_fit_cfg
                 )
-                if not can_optimize:
-                    # If we can't fit, we break the "repeats" loop
-                    break
+                results_this_iter.hard_perms = [
+                    [perms_this_group[idx_rep] for perms_this_group in perms_this_epoch]
+                    for idx_rep in range(n_repeats)
+                    for perms_this_epoch in results_this_iter.hard_perms
+                ]
+                results_this_iter.hard_losses = [
+                    losses_this_epoch[idx_rep]
+                    for idx_rep in range(n_repeats)
+                    for losses_this_epoch in results_this_iter.hard_losses
+                ]
 
             postprocess_results_after_repeats(
                 results_this_iter, results, can_optimize
