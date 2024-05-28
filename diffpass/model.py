@@ -68,7 +68,6 @@ class GeneralizedPermutation(Module):
     ) -> None:
         super().__init__()
         self.group_sizes = group_sizes
-        self.batch_size = batch_size
 
         self.init_batch_size_fixed_pairings_and_log_alphas(batch_size, fixed_pairings)
 
