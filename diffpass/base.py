@@ -579,7 +579,9 @@ class DiffPaSSModel(Module):
             mapped_idxs: np.ndarray, N: int
         ) -> IndexPairsInGroups:
             """Subroutine for randomly sampling new fixed pairings for the next bootstrap iteration."""
-            rand_fixed_idxs = np.random.permutation(non_initially_fixed_idxs)[:N]
+            rand_fixed_idxs = np.random.choice(
+                non_initially_fixed_idxs, size=N, replace=False
+            )
             rand_fixed_idxs = np.sort(rand_fixed_idxs)
             rand_mapped_idxs = mapped_idxs[rand_fixed_idxs]
             rand_group_idxs = group_idxs[rand_fixed_idxs]
