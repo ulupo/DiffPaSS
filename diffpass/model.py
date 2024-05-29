@@ -64,6 +64,7 @@ class GeneralizedPermutation(Module):
         noise: bool = False,
         noise_factor: float = 1.0,
         noise_std: bool = False,
+        unbias_lsa: bool = True,  # Unbias the linear sum assignment (LSA) problem for hard permutations
         mode: Literal["soft", "hard"] = "soft",
     ) -> None:
         super().__init__()
@@ -76,6 +77,7 @@ class GeneralizedPermutation(Module):
         self.noise = noise
         self.noise_factor = noise_factor
         self.noise_std = noise_std
+        self.unbias_lsa = unbias_lsa
         self.mode = mode
 
     def init_batch_size_fixed_pairings_and_log_alphas(
@@ -336,7 +338,7 @@ class GeneralizedPermutation(Module):
             noise=self.noise,
             noise_factor=self.noise_factor,
             noise_std=self.noise_std,
-            unbias_lsa=True,
+            unbias_lsa=self.unbias_lsa,
         )
 
     def forward(self) -> list[torch.Tensor]:
