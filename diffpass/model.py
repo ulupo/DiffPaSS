@@ -53,12 +53,18 @@ def _consecutive_slices_from_sizes(group_sizes: Optional[Sequence[int]]) -> list
 class GeneralizedPermutation(Module):
     """Generalized permutation layer implementing both soft and hard permutations."""
 
+    number_effective_fixed_pairings_: torch.Tensor
+    number_effective_nonfixed_pairings_: torch.Tensor
+    total_number_effective_fixed_pairings_: torch.Tensor
+
     def __init__(
         self,
         *,
         group_sizes: Sequence[int],
         batch_size: Optional[int] = None,
-        fixed_pairings: Optional[IndexPairsInGroups] = None,
+        fixed_pairings: Optional[
+            Union[IndexPairsInGroups, list[IndexPairsInGroups]]
+        ] = None,
         tau: float = 1.0,
         n_iter: int = 1,
         noise: bool = False,
@@ -69,6 +75,28 @@ class GeneralizedPermutation(Module):
     ) -> None:
         super().__init__()
         self.group_sizes = group_sizes
+        ### Buffer initialization ###
+        self.register_buffer(
+            "group_sizes_", torch.tensor(self.group_sizes, dtype=torch.long)
+        )
+        [
+            setattr(
+                self,
+                f"effective_fixed_pairings_{group_idx}_",
+                torch.empty((0, 2), dtype=torch.long),
+            )
+            for group_idx, s in enumerate(self.group_sizes)
+        ]
+        self.register_buffer(
+            "number_effective_fixed_pairings_",
+            torch.zeros(len(self.group_sizes), dtype=torch.long),
+        )
+        self.register_buffer("number_effective_nonfixed_pairings_", self.group_sizes_)
+        self.register_buffer(
+            "total_number_effective_fixed_pairings_",
+            torch.tensor(0, dtype=torch.long),
+        )
+        ### End buffer initialization ###
 
         self.init_batch_size_fixed_pairings_and_log_alphas(batch_size, fixed_pairings)
 
@@ -83,11 +111,15 @@ class GeneralizedPermutation(Module):
     def init_batch_size_fixed_pairings_and_log_alphas(
         self,
         batch_size: Optional[int],
-        fixed_pairings: Optional[IndexPairsInGroups],
+        fixed_pairings: Optional[Union[IndexPairsInGroups, list[IndexPairsInGroups]]],
         device: Optional[torch.device] = None,
     ) -> None:
         """Initialize fixed pairings and parameterization matrices."""
-        self._validate_batch_size_and_fixed_pairings(batch_size, fixed_pairings)
+        self.to(device=device)
+        self._validate_batch_size_and_fixed_pairings(
+            batch_size, fixed_pairings, device=device
+        )
+        # Note: Instance attrs below can't be set in __init__ for bootstrap to work
         self.batch_size = batch_size
         self.fixed_pairings = fixed_pairings
 
@@ -96,141 +128,191 @@ class GeneralizedPermutation(Module):
         if self.batch_size is None:
             self.log_alphas = ParameterList(
                 [
-                    Parameter(torch.zeros(s, s), requires_grad=bool(s))
-                    for s in self._effective_number_nonfixed_pairings
+                    Parameter(torch.zeros(s, s, device=device), requires_grad=bool(s))
+                    for s in self.number_effective_nonfixed_pairings_
                 ]
             )
         else:
             self.log_alphas = ParameterList(
                 [
-                    ParameterList(
-                        [
-                            Parameter(torch.zeros(s, s), requires_grad=bool(s))
-                            for s in self._effective_number_nonfixed_pairings[batch_idx]
-                        ]
+                    Parameter(
+                        torch.zeros(self.batch_size, s, s, device=device),
+                        requires_grad=True,
                     )
-                    for batch_idx in range(self.batch_size)
+                    for s in self.group_sizes
                 ]
             )
-        self.to(device=device)
 
-    def _validate_fixed_pairings_single(
+    def _validate_batch_size_and_fixed_pairings(
         self,
-        fixed_pairings: Optional[IndexPairsInGroups] = None,
-        batch_idx: Optional[int] = None,
-    ) -> tuple[list[IndexPairsInGroup], list[int], list[int], int]:
-        if fixed_pairings:
+        batch_size: Optional[int],
+        fixed_pairings: Optional[Union[IndexPairsInGroups, list[IndexPairsInGroups]]],
+        device: Optional[torch.device] = None,
+    ) -> None:
+        if not fixed_pairings:
+            # None or [] for fixed_pairings can only be if batch_size is None, as per initialization
+            return
+
+        if batch_size is None:
+            # TODO guard this check against case group_sizes == batch_size
             if len(fixed_pairings) != len(self.group_sizes):
                 raise ValueError(
                     "If `fixed_pairings` is provided, it must have the same length as "
                     "`group_sizes`."
                 )
-            for s, fp in zip(self.group_sizes, fixed_pairings):
-                if not fp:
-                    continue
-                if any([len(p) != 2 for p in fp]):
-                    raise ValueError(
-                        "All fixed pairings must be pairs of indices (i, j)."
-                    )
-                if any(min(i, j) < 0 or max(i, j) >= s for i, j in fp):
-                    raise ValueError(
-                        "All fixed pairings must be within the range of the corresponding "
-                        "group size."
-                    )
-            effective_number_fixed_pairings = []
-            effective_number_nonfixed_pairings = []
-            effective_fixed_pairings_zip = []
-            for idx, (s, fp) in enumerate(zip(self.group_sizes, fixed_pairings)):
-                if fp:
-                    num_fp = len(fp)
-                    fp_zip = list(zip(*fp))
-                else:
-                    num_fp = 0
-                    fp_zip = [(), ()]
-                complement = s - num_fp  # Effectively fully fixed when complement <= 1
-                is_fully_fixed = complement <= 1
-                num_efp = s - (s - num_fp) * (not is_fully_fixed)
-                effective_number_fixed_pairings.append(num_efp)
-                effective_number_nonfixed_pairings.append(s - num_efp)
-                not_fixed_mask = getattr(self, f"_not_fixed_mask_{idx}")
-                if is_fully_fixed:
-                    not_fixed_mask[batch_idx, ...] = False
-                    if complement:
-                        possible_idxs = set(range(s))
-                        fp_zip[0] += tuple((possible_idxs - set(fp_zip[0])))
-                        fp_zip[1] += tuple((possible_idxs - set(fp_zip[1])))
-                else:
-                    for i, j in fp:
-                        not_fixed_mask[batch_idx, j, :] = False
-                        not_fixed_mask[batch_idx, :, i] = False
-                effective_fixed_pairings_zip.append(fp_zip)
-            total_number_fixed_pairings = sum(effective_number_fixed_pairings)
-        else:
-            effective_fixed_pairings_zip = [[(), ()] for _ in self.group_sizes]
-            effective_number_fixed_pairings = [0] * len(self.group_sizes)
-            effective_number_nonfixed_pairings = self.group_sizes
-            total_number_fixed_pairings = 0
-
-        return (
-            effective_fixed_pairings_zip,
-            effective_number_fixed_pairings,
-            effective_number_nonfixed_pairings,
-            total_number_fixed_pairings,
-        )
-
-    def _validate_batch_size_and_fixed_pairings(
-        self,
-        batch_size: Optional[int],
-        fixed_pairings: Optional[
-            Union[IndexPairsInGroups, list[IndexPairsInGroups]]
-        ] = None,
-    ) -> None:
-        if batch_size is None:
-            # No batching, expect fixed_pairings is Optional[IndexPairsInGroups] and use `_validate_fixed_pairings_single`
-            for idx, s in enumerate(self.group_sizes):
-                self.register_buffer(
-                    f"_not_fixed_mask_{idx}", torch.ones(s, s, dtype=torch.bool)
+            else:
+                number_effective_fixed_pairings = torch.tensor(
+                    [len(fp) for fp in fixed_pairings],
+                    device=device,
+                    dtype=torch.long,
                 )
-            (
-                self._effective_fixed_pairings_zip,
-                self._effective_number_fixed_pairings,
-                self._effective_number_nonfixed_pairings,
-                self._total_number_fixed_pairings,
-            ) = self._validate_fixed_pairings_single(fixed_pairings)
+                self.number_effective_fixed_pairings_ = number_effective_fixed_pairings
+                self.number_effective_nonfixed_pairings_ = (
+                    self.group_sizes_ - number_effective_fixed_pairings
+                )
+                for group_idx, s in enumerate(self.group_sizes):
+                    not_fixed_mask_this_group = torch.ones(
+                        s, s, dtype=torch.bool, device=device
+                    )
+                    effective_fixed_pairings_this_group = torch.tensor(
+                        fixed_pairings[group_idx], device=device, dtype=torch.long
+                    ).reshape(-1, 2)
+                    num_nonfixed = self.number_effective_nonfixed_pairings_[group_idx]
+                    if not num_nonfixed:
+                        not_fixed_mask_this_group[...] = False
+                    else:
+                        not_fixed_mask_this_group[
+                            effective_fixed_pairings_this_group[:, -1], :
+                        ] = False
+                        not_fixed_mask_this_group[
+                            :, effective_fixed_pairings_this_group[:, -2]
+                        ] = False
+                        if num_nonfixed == 1:
+                            # Note: Transpose because we must reverse the order of the pair
+                            new_fp = not_fixed_mask_this_group.T.nonzero()
+                            effective_fixed_pairings_this_group = torch.cat(
+                                (effective_fixed_pairings_this_group, new_fp), dim=0
+                            )
+                            self.number_effective_fixed_pairings_[group_idx] += 1
+                            self.number_effective_nonfixed_pairings_[group_idx] -= 1
+                            not_fixed_mask_this_group[
+                                new_fp[0][-1],
+                                new_fp[0][-2],
+                            ] = False
+                    setattr(
+                        self, f"_not_fixed_mask_{group_idx}", not_fixed_mask_this_group
+                    )
+                    setattr(
+                        self,
+                        f"effective_fixed_pairings_{group_idx}_",
+                        effective_fixed_pairings_this_group,
+                    )
+                self.total_number_effective_fixed_pairings_ = torch.sum(
+                    self.number_effective_fixed_pairings_
+                )
         elif not isinstance(fixed_pairings, list) or len(fixed_pairings) != batch_size:
+            # If batch_size is not None then fixed_pairings must be a list of length batch_size
             raise ValueError(
-                f"When `batch_size` is not None, `fixed_pairings` must be a list "
-                f"with length equal to `batch_size`."
+                "When `batch_size` is not None, `fixed_pairings` must be a list with "
+                "length equal to `batch_size`. Each element in `fixed_pairings` must "
+                "itself be a list of the same length as `group_sizes`."
             )
         else:
-            # Batching, expect fixed_pairings is list[IndexPairsInGroups]
-            for idx, s in enumerate(self.group_sizes):
-                self.register_buffer(
-                    f"_not_fixed_mask_{idx}",
-                    torch.ones(batch_size, s, s, dtype=torch.bool),
+            # TODO check that each element in fixed_pairings is a list of lists of pairs of the correct lengths
+            number_effective_fixed_pairings = torch.tensor(
+                [
+                    [len(fp) for fp in fixed_pairings_this_batch]
+                    for fixed_pairings_this_batch in fixed_pairings
+                ],
+                device=device,
+                dtype=torch.long,
+            )
+            self.number_effective_fixed_pairings_ = number_effective_fixed_pairings
+            self.number_effective_nonfixed_pairings_ = (
+                self.group_sizes_ - number_effective_fixed_pairings
+            )
+            for group_idx, s in enumerate(self.group_sizes):
+                not_fixed_mask_this_group = torch.ones(
+                    batch_size, s, s, dtype=torch.bool, device=device
                 )
-            (
-                self._effective_fixed_pairings_zip,
-                self._effective_number_fixed_pairings,
-                self._effective_number_nonfixed_pairings,
-                self._total_number_fixed_pairings,
-            ) = zip(
-                *(
-                    self._validate_fixed_pairings_single(
-                        fixed_pairings_this_batch, batch_idx
+                # FIXME list comprehension is performance bottleneck
+                effective_fixed_pairings_this_group = torch.tensor(
+                    [
+                        [batch_idx, pair[0], pair[1]]
+                        for batch_idx, fixed_pairings_this_batch in enumerate(
+                            fixed_pairings
+                        )
+                        if fixed_pairings_this_batch[group_idx]
+                        for pair in fixed_pairings_this_batch[group_idx]
+                    ],
+                    device=device,
+                    dtype=torch.long,
+                )  # Column 0 is batch index
+                # First fill in the fixed rows/columns as given by fixed_pairings
+                not_fixed_mask_this_group[
+                    effective_fixed_pairings_this_group[:, 0],
+                    effective_fixed_pairings_this_group[:, -1],
+                    :,
+                ] = False
+                not_fixed_mask_this_group[
+                    effective_fixed_pairings_this_group[:, 0],
+                    :,
+                    effective_fixed_pairings_this_group[:, -2],
+                ] = False
+                # Now fill in the extra batches that are effectively fully fixed
+                extra_effectively_fixed_batch_idxs = (
+                    self.number_effective_nonfixed_pairings_[:, group_idx] == 1
+                ).nonzero(as_tuple=True)[0]
+                if extra_effectively_fixed_batch_idxs.size(0):
+                    extra_effective_fixed_pairings_this_group = torch.hstack(
+                        (
+                            extra_effectively_fixed_batch_idxs.unsqueeze(-1),
+                            torch.cat(
+                                [
+                                    # Note: Transpose because we must reverse the order of the pair
+                                    not_fixed_mask_this_group[
+                                        batch_idx, ...
+                                    ].T.nonzero()
+                                    for batch_idx in extra_effectively_fixed_batch_idxs
+                                ],
+                                dim=0,
+                            ),
+                        )
                     )
-                    for batch_idx, fixed_pairings_this_batch in enumerate(
-                        fixed_pairings
+                    effective_fixed_pairings_this_group = torch.cat(
+                        (
+                            effective_fixed_pairings_this_group,
+                            extra_effective_fixed_pairings_this_group,
+                        ),
+                        dim=0,
                     )
+                    not_fixed_mask_this_group[
+                        extra_effective_fixed_pairings_this_group[:, 0],
+                        extra_effective_fixed_pairings_this_group[:, -1],
+                        extra_effective_fixed_pairings_this_group[:, -2],
+                    ] = False
+                    self.number_effective_fixed_pairings_[
+                        extra_effectively_fixed_batch_idxs, group_idx
+                    ] += 1
+                    self.number_effective_nonfixed_pairings_[
+                        extra_effectively_fixed_batch_idxs, group_idx
+                    ] -= 1
+                setattr(self, f"_not_fixed_mask_{group_idx}", not_fixed_mask_this_group)
+                setattr(
+                    self,
+                    f"effective_fixed_pairings_{group_idx}_",
+                    effective_fixed_pairings_this_group,
                 )
+
+            self.total_number_effective_fixed_pairings_ = (
+                self.number_effective_fixed_pairings_.sum(-1)
             )
 
-    @property
-    def _not_fixed_masks(self) -> list[torch.Tensor]:
-        return [
-            getattr(self, f"_not_fixed_mask_{idx}")
-            for idx in range(len(self.group_sizes))
-        ]
+    def _not_fixed_mask(self, group_idx: int) -> torch.Tensor:
+        return getattr(self, f"_not_fixed_mask_{group_idx}")
+
+    def effective_fixed_pairings_(self, group_idx: int) -> torch.Tensor:
+        return getattr(self, f"effective_fixed_pairings_{group_idx}_")
 
     @property
     def mode(self) -> str:
@@ -264,8 +346,8 @@ class GeneralizedPermutation(Module):
         def wrapper(group_idx: int) -> torch.Tensor:
             s = self.group_sizes[group_idx]
             mat = func(self.log_alphas[group_idx])
-            row_group, col_group = self._effective_fixed_pairings_zip[group_idx]
-            mask = self._not_fixed_masks[group_idx]  # (s, s)
+            row_group, col_group = self.effective_fixed_pairings_(group_idx).T
+            not_fixed_mask = self._not_fixed_mask(group_idx)  # (s, s)
             mat_all = torch.zeros(
                 s,
                 s,
@@ -275,8 +357,8 @@ class GeneralizedPermutation(Module):
             )
             # mat_all[j, i] = 1 means that row i becomes row j under a permutation,
             # using our conventions
-            mat_all[..., col_group, row_group] = 1
-            mat_all.masked_scatter_(mask, mat)
+            mat_all[col_group, row_group] = 1
+            mat_all.masked_scatter_(not_fixed_mask, mat)
 
             return mat_all
 
@@ -284,39 +366,35 @@ class GeneralizedPermutation(Module):
 
     def _impl_fixed_pairings_batched(self, func: callable) -> callable:
         """Include fixed pairings in the Gumbel-Sinkhorn or Gumbel-matching operators."""
+        dtype = self.log_alphas[0][0].dtype
+        layout = self.log_alphas[0][0].layout
+        device = self.log_alphas[0][0].device
 
         def wrapper(group_idx: int) -> torch.Tensor:
             s = self.group_sizes[group_idx]
-            mats = [
-                func(log_alphas_this_batch[group_idx])
-                for log_alphas_this_batch in self.log_alphas
-            ]
-            row_groups, col_groups = zip(
-                *[
-                    effective_fixed_pairings_zip[group_idx]
-                    for effective_fixed_pairings_zip in self._effective_fixed_pairings_zip
-                ]
+            effective_fixed_pairings_this_group = self.effective_fixed_pairings_(
+                group_idx
             )
-            masks = self._not_fixed_masks[group_idx]  # (batch_size, s, s)
-            mats_all = torch.zeros(
-                self.batch_size,
-                s,
-                s,
-                dtype=mats[0].dtype,
-                layout=mats[0].layout,
-                device=mats[0].device,
+            not_fixed_masks = self._not_fixed_mask(group_idx)  # (batch_size, s, s)
+            mats_all = torch.full(
+                (self.batch_size, s, s),
+                -torch.inf,
+                dtype=dtype,
+                layout=layout,
+                device=device,
             )
             # mat_all[j, i] = 1 means that row i becomes row j under a permutation,
             # using our conventions
-            for batch_idx, (row_group, col_group) in enumerate(
-                zip(row_groups, col_groups)
-            ):
-                mats_all[batch_idx, col_group, row_group] = 1
-                mats_all[batch_idx, ...].masked_scatter_(
-                    masks[batch_idx], mats[batch_idx]
-                )
+            mats_all[
+                effective_fixed_pairings_this_group[:, 0],
+                effective_fixed_pairings_this_group[:, -1],
+                effective_fixed_pairings_this_group[:, -2],
+            ] = 0.0
+            mats_all.masked_scatter_(
+                not_fixed_masks, self.log_alphas[group_idx][not_fixed_masks]
+            )
 
-            return mats_all
+            return func(mats_all)
 
         return wrapper
 

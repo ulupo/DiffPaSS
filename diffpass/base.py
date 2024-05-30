@@ -370,9 +370,10 @@ class DiffPaSSModel(Module):
 
     def check_can_optimize(self) -> bool:
         n_samples = sum(self.group_sizes)
-        n_effectively_fixed = np.array(self.permutation._total_number_fixed_pairings)
 
-        return np.all(n_effectively_fixed < n_samples)
+        return torch.all(
+            self.permutation.total_number_effective_fixed_pairings_ < n_samples
+        ).item()
 
     def mean_center_log_alphas(self) -> None:
         with torch.no_grad():
@@ -541,8 +542,8 @@ class DiffPaSSModel(Module):
         # Prepare variables for indexing
         n_samples = len(x)
         n_groups = len(self.group_sizes)
-        cumsum_group_sizes = np.cumsum([0] + list(self.group_sizes))
-        offsets = np.repeat(cumsum_group_sizes[:-1], repeats=self.group_sizes)
+        cumsum_group_sizes = np.cumsum([0] + list(self.group_sizes)[:-1])
+        offsets = np.repeat(cumsum_group_sizes, repeats=self.group_sizes)
         group_idxs = np.repeat(np.arange(n_groups), repeats=self.group_sizes)
 
         # Initially fixed pairings as derived from the `fixed_pairings` attribute
@@ -555,13 +556,9 @@ class DiffPaSSModel(Module):
         # Used to exclude these pairs from the random sampling of new fixed pairings
         # and to determine when the bootstrap will end
         effective_initially_fixed_idxs = []
-        for s, efmz in zip(
-            cumsum_group_sizes, self.permutation._effective_fixed_pairings_zip
-        ):
-            if efmz:
-                effective_initially_fixed_idxs += [
-                    s + efmz_fixed for efmz_fixed in efmz[1]
-                ]
+        for group_idx, s in enumerate(cumsum_group_sizes):
+            efp_fixed = self.permutation.effective_fixed_pairings_(group_idx)[:, 1]
+            effective_initially_fixed_idxs += (s + efp_fixed).tolist()
         non_initially_fixed_idxs = np.setdiff1d(
             np.arange(n_samples), effective_initially_fixed_idxs
         )
