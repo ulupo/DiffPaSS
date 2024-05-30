@@ -247,6 +247,8 @@ class GeneralizedPermutation(Module):
                     ],
                     device=device,
                     dtype=torch.long,
+                ).reshape(
+                    -1, 3
                 )  # Column 0 is batch index
                 # First fill in the fixed rows/columns as given by fixed_pairings
                 not_fixed_mask_this_group[
