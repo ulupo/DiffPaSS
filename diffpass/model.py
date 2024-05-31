@@ -262,8 +262,8 @@ class GeneralizedPermutation(Module):
                     effective_fixed_pairings_this_group[:, -2],
                 ] = False
                 # Now fill in the extra batches that are effectively fully fixed
-                extra_effectively_fixed_batch_idxs = (
-                    self.number_effective_nonfixed_pairings_[:, group_idx] == 1
+                extra_effectively_fixed_batch_idxs = torch.eq(
+                    self.number_effective_nonfixed_pairings_[:, group_idx], 1
                 ).nonzero(as_tuple=True)[0]
                 if extra_effectively_fixed_batch_idxs.size(0):
                     extra_effective_fixed_pairings_this_group = torch.hstack(
